@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.env
+.env.*
+*.sqlite*
+*.nexus.json
+settings.ini
