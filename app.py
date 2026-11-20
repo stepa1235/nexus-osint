@@ -8,10 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QDate, QSettings, Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsScene, QGraphicsView,
+    QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsScene, QGraphicsView,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton,
     QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
@@ -23,6 +23,7 @@ from graph_export import serialize_graph
 from project_archive import export_project, import_project
 from core import SourceClient, SourceResult, Store, analyze, ollama_models
 from sources import discover
+from timeline import date_variants, event_label
 
 
 class Window(QWidget):
@@ -60,7 +61,12 @@ class Window(QWidget):
         project_tools.addStretch()
         self.notes = QTextEdit(placeholderText="Заметки проекта")
         dashboard.addWidget(self.notes)
+        self.notes_timer = QTimer(self)
+        self.notes_timer.setSingleShot(True)
+        self.notes_timer.setInterval(1200)
+        self.notes_project = None
         self.notes.textChanged.connect(self.save_notes)
+        self.button(project_tools, "История заметок", self.show_note_history)
 
         search = self.panel("Search Hub")
         self.sources = QComboBox()
@@ -81,6 +87,7 @@ class Window(QWidget):
         search.addStretch()
 
         evidence = self.panel("Evidence Manager")
+        self.evidence_page = evidence.parentWidget()
         self.evidence_query = QLineEdit(placeholderText="Поиск по сохранённым материалам")
         self.evidence_query.returnPressed.connect(self.search_evidence)
         evidence.addWidget(self.evidence_query)
@@ -90,6 +97,19 @@ class Window(QWidget):
         evidence.addWidget(self.items)
         evidence.addWidget(self.material)
         self.items.currentRowChanged.connect(self.open_evidence)
+
+        timeline = self.panel("Хронология")
+        timeline_tools = QHBoxLayout()
+        timeline.addLayout(timeline_tools)
+        self.button(timeline_tools, "Добавить событие", lambda: self.edit_event())
+        self.button(timeline_tools, "Изменить", self.edit_selected_event)
+        self.button(timeline_tools, "Удалить", self.remove_event)
+        self.button(timeline_tools, "Открыть источник", self.open_event_source)
+        self.timeline_items = QListWidget()
+        timeline.addWidget(self.timeline_items)
+        self.timeline_details = QTextEdit(readOnly=True)
+        timeline.addWidget(self.timeline_details)
+        self.timeline_items.currentRowChanged.connect(self.show_event)
 
         graph = self.panel("Graph Explorer")
         self.scene = QGraphicsScene(self)
@@ -203,6 +223,8 @@ class Window(QWidget):
             self.status.setText("Проект удалён из рабочей базы")
 
     def refresh(self):
+        if self.notes_project != self.project:
+            self.notes_timer.stop()
         self.rows = self.store.evidence(self.project)
         self.evidence_query.clear()
         self.items.clear()
@@ -218,7 +240,117 @@ class Window(QWidget):
         for item in self.rows:
             self.items.addItem(item["title"])
         self.draw_graph()
+        self.refresh_timeline()
         self.refresh_api_log()
+
+    def refresh_timeline(self):
+        self.events = self.store.timeline(self.project)
+        variants = date_variants(self.events)
+        self.timeline_items.clear()
+        for event in self.events:
+            self.timeline_items.addItem(event_label(event, variants))
+        if self.events:
+            self.timeline_items.setCurrentRow(0)
+        else:
+            self.timeline_details.clear()
+
+    def selected_event(self):
+        index = self.timeline_items.currentRow()
+        if 0 <= index < len(self.events):
+            return self.events[index]
+        return None
+
+    def show_event(self):
+        event = self.selected_event()
+        if event is None:
+            self.timeline_details.clear()
+            return
+        source = f'[{event["evidence"]}] {event["source"]}' if event["evidence"] is not None else "Гипотеза"
+        self.timeline_details.setPlainText(f'{event["notes"]}\n\n{source}'.strip())
+
+    def open_event_source(self):
+        event = self.selected_event()
+        if event is not None and event["evidence"] is not None:
+            for index, row in enumerate(self.rows):
+                if row["id"] == event["evidence"]:
+                    self.tabs.setCurrentWidget(self.evidence_page)
+                    self.items.setCurrentRow(index)
+                    self.open_evidence(index)
+                    return
+        self.status.setText("Выберите событие с источником")
+
+    def edit_selected_event(self):
+        event = self.selected_event()
+        if event is None:
+            self.status.setText("Выберите событие")
+            return
+        self.edit_event(event)
+
+    def edit_event(self, event=None):
+        project = self.project
+        if project is None:
+            self.status.setText("Создайте проект")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Изменить событие" if event else "Добавить событие")
+        layout = QFormLayout(dialog)
+        day = QDateEdit(calendarPopup=True, displayFormat="yyyy-MM-dd")
+        day.setMinimumDate(QDate(1, 1, 1))
+        day.setMaximumDate(QDate(9999, 12, 31))
+        day.setDate(QDate.fromString(event["date"], Qt.DateFormat.ISODate) if event else QDate.currentDate())
+        title = QLineEdit(event["title"] if event else "")
+        title.setObjectName("eventTitle")
+        title.setMaxLength(300)
+        source = QComboBox()
+        source.addItem("Без источника · гипотеза", None)
+        for row in self.rows:
+            source.addItem(f'[{row["id"]}] {row["title"]}', row["id"])
+        if event and event["evidence"] is not None:
+            source.setCurrentIndex(source.findData(event["evidence"]))
+        notes = QTextEdit()
+        notes.setPlainText(event["notes"] if event else "")
+        layout.addRow("Дата", day)
+        layout.addRow("Название", title)
+        layout.addRow("Материал", source)
+        layout.addRow("Описание", notes)
+        error_label = QLabel()
+        error_label.setWordWrap(True)
+        layout.addRow(error_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addRow(buttons)
+
+        def save():
+            try:
+                self.store.save_event(
+                    project, day.date().toString(Qt.DateFormat.ISODate), title.text(),
+                    notes.toPlainText(), source.currentData(), event=event["id"] if event else None,
+                )
+            except (ValueError, sqlite3.Error) as error:
+                error_label.setText(str(error))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_timeline()
+            self.status.setText("Событие сохранено")
+
+    def remove_event(self):
+        event = self.selected_event()
+        if event is None:
+            self.status.setText("Выберите событие")
+            return
+        if QMessageBox.question(
+            self, "Удалить событие", "Удалить выбранное событие из хронологии?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self.store.delete_event(self.project, event["id"])
+            self.refresh_timeline()
+            self.status.setText("Событие удалено")
 
     def draw_graph(self):
         self.scene.clear()
@@ -324,9 +456,58 @@ class Window(QWidget):
         self.status.setText("Связь сохранена")
 
     def save_notes(self):
-        with self.store.db:
-            self.store.db.execute("UPDATE projects SET notes=? WHERE id=?",
-                                  (self.notes.toPlainText(), self.project))
+        project = self.project
+        if project is None:
+            return
+        checkpoint = project != self.notes_project or not self.notes_timer.isActive()
+        try:
+            saved = self.store.save_notes(project, self.notes.toPlainText(), checkpoint=checkpoint)
+        except sqlite3.Error as error:
+            self.status.setText(f"Ошибка сохранения заметок: {error}")
+            return
+        if saved:
+            self.notes_project = project
+            self.notes_timer.start()
+
+    def show_note_history(self):
+        if self.project is None:
+            self.status.setText("Выберите проект")
+            return
+        project = self.project
+        versions = self.store.note_versions(project, limit=100)
+        if not versions:
+            self.status.setText("У заметок пока нет сохранённых версий")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("История заметок")
+        dialog.resize(720, 480)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Последние 100 предыдущих версий"))
+        choices = QComboBox()
+        layout.addWidget(choices)
+        for version in versions:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(version["created"]))
+            choices.addItem(f'{stamp} · версия {version["id"]}', version["id"])
+        preview = QTextEdit(readOnly=True)
+        layout.addWidget(preview, 1)
+        choices.currentIndexChanged.connect(lambda index: preview.setPlainText(versions[index]["body"]))
+        preview.setPlainText(versions[0]["body"])
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        restore = buttons.addButton("Восстановить", QDialogButtonBox.ButtonRole.AcceptRole)
+        restore.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                body = self.store.restore_note(project, choices.currentData())
+            except (ValueError, sqlite3.Error) as error:
+                self.status.setText(f"Ошибка восстановления заметки: {error}")
+                return
+            self.notes.blockSignals(True)
+            self.notes.setPlainText(body)
+            self.notes.blockSignals(False)
+            self.notes_timer.stop()
+            self.status.setText("Версия заметки восстановлена")
 
     def search_evidence(self):
         query = self.evidence_query.text().strip()
@@ -653,6 +834,17 @@ class Window(QWidget):
         if not filename:
             return
         sections = [f"# {self.projects.currentText()}", self.notes.toPlainText()]
+        events = self.store.timeline(self.project)
+        if events:
+            variants = date_variants(events)
+            entries = []
+            for event in events:
+                lines = [event_label(event, variants), event["notes"]]
+                if event["source"]:
+                    lines.append(f'[{event["evidence"]}] {event["source"]}')
+                entries.append("\n".join(lines))
+            details = "\n\n".join(entries)
+            sections.append("## Хронология\n\n" + "\n".join("    " + line for line in details.splitlines()))
         for row in self.rows:
             sections.append(f'## [{row["id"]}] {row["title"]}\n\nИсточник: {row["source"]}\n\n'
                             + "\n".join("    " + line for line in row["body"].splitlines()))

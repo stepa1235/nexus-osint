@@ -4,6 +4,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlsplit
@@ -102,11 +103,22 @@ class Store:
             CREATE TABLE IF NOT EXISTS projects(
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, notes TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS note_versions(
+                id INTEGER PRIMARY KEY, project INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                body TEXT NOT NULL, created INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS note_versions_project ON note_versions(project, id);
             CREATE TABLE IF NOT EXISTS evidence(
                 id INTEGER PRIMARY KEY, project INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 title TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL, collected INTEGER NOT NULL,
                 UNIQUE(project, source, body)
             );
+            CREATE TABLE IF NOT EXISTS timeline_events(
+                id INTEGER PRIMARY KEY, project INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                date TEXT NOT NULL, title TEXT NOT NULL, notes TEXT NOT NULL,
+                evidence INTEGER REFERENCES evidence(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS timeline_project_date ON timeline_events(project,date,id);
             CREATE TABLE IF NOT EXISTS analyses(
                 id INTEGER PRIMARY KEY, project INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 engine TEXT NOT NULL, model TEXT NOT NULL, question TEXT NOT NULL, claims TEXT NOT NULL
@@ -146,6 +158,38 @@ class Store:
         with self.transaction():
             return self.db.execute("INSERT INTO projects(name) VALUES (?)", (name.strip(),)).lastrowid
 
+    def note_versions(self, project, limit=None):
+        return self.db.execute("""
+            SELECT id,body,created FROM note_versions WHERE project=? ORDER BY id DESC LIMIT ?
+        """, (project, -1 if limit is None else limit)).fetchall()
+
+    def add_note_version(self, project, body, created):
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO note_versions(project,body,created) VALUES(?,?,?)",
+                (project, body, created),
+            )
+
+    def save_notes(self, project, body, *, checkpoint=False):
+        with self.transaction():
+            row = self.db.execute("SELECT notes FROM projects WHERE id=?", (project,)).fetchone()
+            if row is None or row["notes"] == body:
+                return False
+            if checkpoint:
+                self.add_note_version(project, row["notes"], int(time.time()))
+            self.db.execute("UPDATE projects SET notes=? WHERE id=?", (body, project))
+            return True
+
+    def restore_note(self, project, version):
+        with self.transaction():
+            row = self.db.execute(
+                "SELECT body FROM note_versions WHERE id=? AND project=?", (version, project)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Версия заметки не найдена в текущем проекте")
+            self.save_notes(project, row["body"], checkpoint=True)
+            return row["body"]
+
     def delete_project(self, project):
         with self.transaction():
             self.db.execute("""
@@ -174,6 +218,36 @@ class Store:
         return self.db.execute(
             "SELECT * FROM evidence WHERE project=? ORDER BY id DESC", (project,)
         ).fetchall()
+
+    def timeline(self, project):
+        return self.db.execute("""
+            SELECT t.*, e.source FROM timeline_events t LEFT JOIN evidence e ON e.id=t.evidence
+            WHERE t.project=? ORDER BY t.date,t.id
+        """, (project,)).fetchall()
+
+    def save_event(self, project, day, title, notes, evidence, *, event=None):
+        day = date.fromisoformat(day).isoformat()
+        title = title.strip()
+        if not title or len(title) > 300 or len(notes) > 8000:
+            raise ValueError("Введите название до 300 символов и описание до 8000 символов")
+        with self.transaction():
+            if evidence is not None and not self.db.execute(
+                "SELECT 1 FROM evidence WHERE project=? AND id=?", (project, evidence)
+            ).fetchone():
+                raise ValueError("Выберите материал текущего проекта")
+            values = (day, title, notes, evidence, project)
+            if event is None:
+                self.db.execute(
+                    "INSERT INTO timeline_events(date,title,notes,evidence,project) VALUES(?,?,?,?,?)", values
+                )
+            elif not self.db.execute("""
+                UPDATE timeline_events SET date=?,title=?,notes=?,evidence=? WHERE project=? AND id=?
+            """, (*values, event)).rowcount:
+                raise ValueError("Событие не найдено в текущем проекте")
+
+    def delete_event(self, project, event):
+        with self.transaction():
+            self.db.execute("DELETE FROM timeline_events WHERE project=? AND id=?", (project, event))
 
     def add_entity(self, project, kind, label):
         label = label.strip()
