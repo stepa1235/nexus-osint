@@ -9,7 +9,10 @@ from unittest.mock import patch
 from core import SourceResult, Store
 
 try:
-    from app import QApplication, QFileDialog, QInputDialog, QMessageBox, Window
+    from app import (
+        QApplication, QComboBox, QDate, QDateEdit, QDialog, QDialogButtonBox,
+        QFileDialog, QInputDialog, QLineEdit, QMessageBox, QTimer, Window,
+    )
 except ModuleNotFoundError as error:
     if error.name != "PySide6":
         raise
@@ -194,6 +197,63 @@ class DesktopTests(unittest.TestCase):
                     self.assertNotEqual(window.project, original)
                     self.assertEqual(window.projects.count(), 2)
                     self.assertEqual(window.notes.toPlainText(), "Заметка для переноса")
+                finally:
+                    window.close()
+                    window.pool.shutdown()
+                    window.store.db.close()
+
+
+    def test_note_history_restores_previous_edit_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"XDG_DATA_HOME": directory}):
+                window = Window()
+                try:
+                    project = window.store.project("Проект")
+                    window.load_projects(project)
+                    window.notes.setPlainText("Черновик")
+                    window.notes.setPlainText("Первая версия")
+                    window.notes_timer.stop()
+                    window.notes.setPlainText("Вторая версия")
+                    with patch.object(QDialog, "exec", return_value=QDialog.DialogCode.Accepted):
+                        window.show_note_history()
+                    self.assertEqual(window.notes.toPlainText(), "Первая версия")
+                    self.assertEqual(window.store.note_versions(project)[0]["body"], "Вторая версия")
+                finally:
+                    window.close()
+                    window.pool.shutdown()
+                    window.store.db.close()
+
+    def test_timeline_add_source_navigation_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"XDG_DATA_HOME": directory}):
+                window = Window()
+                try:
+                    project = window.store.project("Расследование")
+                    evidence = window.store.add(project, "Документ", "file:///source", "Текст")
+                    window.store.save_event(project, "2024-03-02", "Публикация", "", None)
+                    window.load_projects(project)
+
+                    def fill_event():
+                        dialog = self.application.activeModalWidget()
+                        dialog.findChild(QLineEdit, "eventTitle").setText("Публикация")
+                        dialog.findChild(QDateEdit).setDate(QDate(2024, 3, 1))
+                        source = dialog.findChild(QComboBox)
+                        source.setCurrentIndex(source.findData(evidence))
+                        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save).click()
+
+                    QTimer.singleShot(0, fill_event)
+                    window.edit_event()
+                    self.assertEqual(window.timeline_items.count(), 2)
+                    self.assertIn("Одно название, разные даты", window.timeline_items.item(0).text())
+                    self.assertIn("2024-03-01", window.timeline_items.item(0).text())
+                    window.open_event_source()
+                    self.assertEqual(window.tabs.currentWidget(), window.evidence_page)
+                    self.assertIn("file:///source", window.material.toPlainText())
+                    report = Path(directory) / "report.md"
+                    with patch.object(QFileDialog, "getSaveFileName", return_value=(str(report), "")):
+                        window.export()
+                    self.assertIn("Хронология", report.read_text(encoding="utf-8"))
+                    self.assertIn("2024-03-01", report.read_text(encoding="utf-8"))
                 finally:
                     window.close()
                     window.pool.shutdown()

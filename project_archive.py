@@ -36,7 +36,11 @@ def export_project(database, project, destination):
             "format": FORMAT,
             "version": VERSION,
             "project": dict(meta),
+            "note_versions": [
+                fields(row, "body created") for row in reversed(store.note_versions(project))
+            ],
             "evidence": [fields(row, "id title source body collected") for row in reversed(store.evidence(project))],
+            "timeline": [fields(row, "date title notes evidence") for row in store.timeline(project)],
             "entities": [fields(row, "id kind label") for row in store.entities(project)],
             "relationships": [fields(row, "origin destination relation confidence evidence")
                               for row in store.relationships(project)],
@@ -130,6 +134,8 @@ def restore(store, payload):
     meta = payload["project"]
     project = store.project(text(meta, "name"))
     store.db.execute("UPDATE projects SET notes=? WHERE id=?", (text(meta, "notes"), project))
+    for row in records(payload.get("note_versions", [])):
+        store.add_note_version(project, text(row, "body"), integer(row["created"]))
     evidence = {}
     for row in records(payload["evidence"]):
         old_id = integer(row["id"])
@@ -138,6 +144,12 @@ def restore(store, payload):
         source, body = text(row, "source"), text(row, "body")
         new_id = store.add(project, text(row, "title"), source, body, collected=integer(row["collected"]))
         evidence[old_id] = EvidenceRef(new_id, source, body)
+    for row in records(payload.get("timeline", [])):
+        ref = row["evidence"]
+        store.save_event(
+            project, text(row, "date"), text(row, "title"), text(row, "notes"),
+            evidence[integer(ref)].id if ref is not None else None,
+        )
     entities = {}
     for row in records(payload["entities"]):
         old_id = integer(row["id"])

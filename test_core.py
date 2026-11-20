@@ -69,6 +69,26 @@ class CoreTests(unittest.TestCase):
             finally:
                 store.db.close()
 
+    def test_note_history_restoration_is_reversible_and_project_scoped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "projects.db")
+            try:
+                project, other = store.project("Проект"), store.project("Другой")
+                store.save_notes(project, "Черновик", checkpoint=True)
+                store.save_notes(project, "Первая версия")
+                store.save_notes(project, "Вторая версия", checkpoint=True)
+                self.assertFalse(store.save_notes(project, "Вторая версия", checkpoint=True))
+                first = store.note_versions(project)[0]
+                self.assertEqual(first["body"], "Первая версия")
+                with self.assertRaises(ValueError):
+                    store.restore_note(other, first["id"])
+                self.assertEqual(store.restore_note(project, first["id"]), "Первая версия")
+                self.assertEqual(store.note_versions(project)[0]["body"], "Вторая версия")
+                store.delete_project(project)
+                self.assertEqual(store.note_versions(project), [])
+            finally:
+                store.db.close()
+
     def test_source_urls(self):
         self.assertIn("name=example.org", dns("Example.ORG."))
         self.assertIn("example.org", ct("example.org"))
